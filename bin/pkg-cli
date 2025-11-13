@@ -45,9 +45,11 @@ readonly CYAN='\033[0;36m'
 readonly MAGENTA='\033[0;35m'
 readonly NC='\033[0m'
 
-# Configurable paths (can be overridden)
-PKGS_SOURCE="${PKGS_SOURCE:-${HOME}/.pkgs}"  # Default to ~/.pkgs, allow env var override
-PKGS_TARGET="${PKGS_TARGET:-${HOME}}"         # Default to $HOME, allow env var override
+# Configurable paths (can be overridden via environment variables)
+PKGS_SOURCE="${PKGS_SOURCE:-${HOME}/.pkgs}"       # Default to ~/.pkgs
+PKGS_TARGET="${PKGS_TARGET:-${HOME}}"             # Default to $HOME
+PKGS_GITHUB_USER="${PKGS_GITHUB_USER:-andronics}" # Default to andronics, override for forks
+PKGS_GITHUB_URL="${PKGS_GITHUB_URL:-https://github.com}"  # Default to github.com, supports mirrors
 
 # Flags
 DRY_RUN=false
@@ -871,7 +873,14 @@ cmd_clone() {
     echo
     print_colored "${YELLOW}TODO:${NC} Clone package from GitHub"
     echo "  Will support: pkg-cli clone @core/lib"
-    echo "  Repository: github.com/andronics/pkg-core-lib"
+    echo
+    echo "  Example implementation (post-Phase 4):"
+    echo "    Repository: ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/pkg-core-lib"
+    echo "    Command: git clone ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/pkg-core-lib ${PKGS_SOURCE}/lib"
+    echo
+    echo "  Configuration (environment variables):"
+    echo "    PKGS_GITHUB_USER=${PKGS_GITHUB_USER} (override for forks)"
+    echo "    PKGS_GITHUB_URL=${PKGS_GITHUB_URL} (override for mirrors)"
     echo
     echo "For now, manually clone packages to ${PKGS_SOURCE}/"
     return 1
@@ -882,9 +891,12 @@ cmd_update() {
     echo
     print_colored "${YELLOW}TODO:${NC} Update package from GitHub"
     echo "  Will support: pkg-cli update @core/lib"
-    echo "  Will run: git pull in package directory"
     echo
-    echo "For now, manually pull updates in package directories"
+    echo "  Example implementation (post-Phase 4):"
+    echo "    Command: git -C ${PKGS_SOURCE}/lib pull"
+    echo
+    echo "For now, manually pull updates in package directories:"
+    echo "  cd ${PKGS_SOURCE}/lib && git pull"
     return 1
 }
 
@@ -893,10 +905,17 @@ cmd_remote() {
     echo
     print_colored "${YELLOW}TODO:${NC} List remote packages"
     echo "  Will support: pkg-cli remote list"
-    echo "  Will query: github.com/andronics/pkg-* repositories"
+    echo
+    echo "  Example implementation (post-Phase 4):"
+    echo "    Query: ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/pkg-* repositories"
+    echo "    Method: GitHub API or web scraping (no gh CLI required)"
+    echo
+    echo "  Configuration (environment variables):"
+    echo "    PKGS_GITHUB_USER=${PKGS_GITHUB_USER}"
+    echo "    PKGS_GITHUB_URL=${PKGS_GITHUB_URL}"
     echo
     echo "For now, check GitHub directly at:"
-    echo "  https://github.com/andronics?tab=repositories"
+    echo "  ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}?tab=repositories"
     return 1
 }
 

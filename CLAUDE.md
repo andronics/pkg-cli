@@ -222,17 +222,25 @@ Update summary count from `[7/7]` to `[8/8]`.
 
 **Post-Phase 4 Implementation:**
 
+**IMPORTANT**: Use `git` commands, NOT `gh` CLI. While `gh` is convenient for development, production should use standard `git` for better portability.
+
 1. **Clone Command**
    ```bash
    cmd_clone() {
        local package="$1"
 
-       # Convert @core/lib → pkg-core-lib
-       local repo_name="${package//@/pkg-}"
+       # Convert @core/lib → lib (directory name)
+       local pkg_dir="${package#@*/}"  # Remove @collection/ prefix
+
+       # Convert @core/lib → pkg-core-lib (repo name)
+       local repo_name="pkg-${package//@/}"
        repo_name="${repo_name//\//-}"
 
-       # Clone from GitHub
-       gh repo clone "andronics/${repo_name}" "${PKGS_SOURCE}/${package}"
+       # Clone using git (not gh)
+       local repo_url="${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/${repo_name}.git"
+
+       log_info "Cloning ${package} from ${repo_url}"
+       git clone "${repo_url}" "${PKGS_SOURCE}/${pkg_dir}"
    }
    ```
 
@@ -240,13 +248,14 @@ Update summary count from `[7/7]` to `[8/8]`.
    ```bash
    cmd_update() {
        local package="$1"
-       local pkg_dir="${PKGS_SOURCE}/${package}"
+       local pkg_dir="${PKGS_SOURCE}/${package#@*/}"
 
        [[ ! -d "${pkg_dir}/.git" ]] && {
            log_error "Not a git repository: ${package}"
            return 1
        }
 
+       log_info "Updating ${package}"
        git -C "${pkg_dir}" pull
    }
    ```
@@ -254,9 +263,19 @@ Update summary count from `[7/7]` to `[8/8]`.
 3. **Remote List**
    ```bash
    cmd_remote() {
-       gh repo list andronics --limit 100 | grep "^pkg-"
+       # Use GitHub API (no gh CLI required)
+       local api_url="${PKGS_GITHUB_URL}/api/v3/users/${PKGS_GITHUB_USER}/repos"
+
+       curl -s "${api_url}" | \
+           grep '"name":' | \
+           grep 'pkg-' | \
+           sed 's/.*"name": "\(.*\)",/\1/'
    }
    ```
+
+**Configuration Variables:**
+- `PKGS_GITHUB_USER` - GitHub username/org (default: "andronics", override for forks)
+- `PKGS_GITHUB_URL` - GitHub URL (default: "https://github.com", supports mirrors)
 
 **Don't implement these yet** - wait for Phase 4 when repos exist.
 
@@ -350,12 +369,25 @@ shellcheck ~/.pkg-cli/bin/pkg-cli  # If installed
 ### Global Configuration
 
 ```bash
-PKG_CLI_VERSION="0.1.0"              # Version number
-PKG_CLI_DIR="<path-to-bin>"          # Where pkg-cli is installed
-CONFIG_FILE="package.conf"           # Config filename
-AUTO_IGNORE="package.conf|\.git.*"   # Always ignored patterns
-PKGS_SOURCE="${HOME}/.pkgs"          # Package source directory
-PKGS_TARGET="${HOME}"                # Installation target
+PKG_CLI_VERSION="0.1.0"                        # Version number
+PKG_CLI_DIR="<path-to-bin>"                    # Where pkg-cli is installed
+CONFIG_FILE="package.conf"                     # Config filename
+AUTO_IGNORE="package.conf|\.git.*"             # Always ignored patterns
+PKGS_SOURCE="${HOME}/.pkgs"                    # Package source directory
+PKGS_TARGET="${HOME}"                          # Installation target
+PKGS_GITHUB_USER="${PKGS_GITHUB_USER:-andronics}"  # GitHub user/org (configurable for forks)
+PKGS_GITHUB_URL="${PKGS_GITHUB_URL:-https://github.com}"  # GitHub URL (supports mirrors)
+```
+
+**Environment Variable Overrides:**
+
+Users can override these for forks or mirrors:
+```bash
+# For forks
+PKGS_GITHUB_USER="myusername" pkg-cli clone @core/lib
+
+# For GitHub Enterprise or mirrors
+PKGS_GITHUB_URL="https://github.enterprise.com" pkg-cli clone @core/lib
 ```
 
 ### Global Flags

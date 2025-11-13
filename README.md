@@ -178,11 +178,17 @@ ignore=("README.md" "docs" ".*\.backup" "screenshots")
 
 **Status:** Implemented as stubs in Phase 2, full implementation post-Phase 4
 
+**Note:** Production implementation will use standard `git` commands, NOT `gh` CLI, for better portability.
+
 ```bash
 # These commands show TODO messages currently
-pkg-cli clone @core/lib      # Clone from github.com/andronics/pkg-core-lib
-pkg-cli update @core/lib      # Pull latest changes
-pkg-cli remote list           # List available packages
+pkg-cli clone @core/lib      # Will use: git clone https://github.com/andronics/pkg-core-lib
+pkg-cli update @core/lib      # Will use: git pull
+pkg-cli remote list           # Will use: GitHub API or curl
+
+# Configuration via environment variables
+PKGS_GITHUB_USER="myuser" pkg-cli clone @core/lib  # Override for forks
+PKGS_GITHUB_URL="https://mirror.com" pkg-cli clone @core/lib  # Override for mirrors
 ```
 
 ## Package Structure
@@ -251,8 +257,12 @@ validate() { ... }
 
 ### Environment Variables
 
-- `PKGS_SOURCE`: Package source directory (default: `~/.pkgs`)
-- `PKGS_TARGET`: Installation target directory (default: `$HOME`)
+- **`PKGS_SOURCE`**: Package source directory (default: `~/.pkgs`)
+- **`PKGS_TARGET`**: Installation target directory (default: `$HOME`)
+- **`PKGS_GITHUB_USER`**: GitHub username/organization (default: `andronics`)
+  - Override for forks: `PKGS_GITHUB_USER="myusername" pkg-cli clone @core/lib`
+- **`PKGS_GITHUB_URL`**: GitHub base URL (default: `https://github.com`)
+  - Override for mirrors: `PKGS_GITHUB_URL="https://github.enterprise.com" pkg-cli clone @core/lib`
 
 ### PATH Setup
 
@@ -260,6 +270,9 @@ Add to `~/.zshrc` or `~/.bashrc`:
 
 ```bash
 export PATH="$HOME/.pkg-cli/bin:$PATH"
+
+# Optional: Override GitHub defaults for forks
+# export PKGS_GITHUB_USER="myusername"
 ```
 
 ## Development
