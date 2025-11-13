@@ -1,0 +1,1168 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ==============================================================================
+# pkg-cli - Standalone Package Manager for pkgs Ecosystem
+# ==============================================================================
+#
+# Version: 0.1.0
+#
+# A standalone bootstrap tool for managing pkgs packages using GNU stow.
+#
+# Features:
+#   - Package installation/uninstallation with GNU stow
+#   - Automatic dependency resolution and installation
+#   - Pre/post install/uninstall hooks
+#   - Package validation and health checks
+#   - Custom ignore patterns per package
+#   - System health diagnostics (doctor command)
+#   - GitHub integration stubs (full implementation post-Phase 4)
+#
+# Usage: pkg-cli [options] <command> [packages...]
+#
+# ==============================================================================
+
+# ------------------------------
+# Configuration
+# ------------------------------
+
+# Version
+readonly PKG_CLI_VERSION="0.1.0"
+
+# Get the directory where pkg-cli is installed
+readonly PKG_CLI_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly CONFIG_FILE="package.conf"
+# Always ignore package.conf and .git* automatically (keep minimal for per-package flexibility)
+readonly AUTO_IGNORE="${CONFIG_FILE}|\.git.*"
+
+# Colors
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly MAGENTA='\033[0;35m'
+readonly NC='\033[0m'
+
+# Configurable paths (can be overridden)
+PKGS_SOURCE="${PKGS_SOURCE:-${HOME}/.pkgs}"  # Default to ~/.pkgs, allow env var override
+PKGS_TARGET="${PKGS_TARGET:-${HOME}}"         # Default to $HOME, allow env var override
+
+# Flags
+DRY_RUN=false
+VERBOSE=false
+SKIP_HOOKS=false
+VALIDATE_INSTALL=true
+
+# ------------------------------
+# Logging functions
+# ------------------------------
+
+log_info() {
+    echo -e "${BLUE}==>${NC} $*"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $*"
+}
+
+log_warn() {
+    echo -e "${YELLOW}⚠${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $*" >&2
+}
+
+log_verbose() {
+    [[ "${VERBOSE}" == true ]] && echo -e "${CYAN}  →${NC} $*"
+}
+
+log_debug() {
+    [[ "${VERBOSE}" == true ]] && echo -e "${CYAN}  [DEBUG]${NC} $*" >&2
+}
+
+die() {
+    log_error "$@"
+    exit 1
+}
+
+print_colored() {
+    printf "%b\n" "$@"
+}
+
+# Compact inline output (overwrites same line)
+log_inline() {
+    printf "\r${CYAN}→${NC} %s" "$*"
+}
+
+log_inline_success() {
+    printf "\r${GREEN}✓${NC} %s\n" "$*"
+}
+
+log_inline_error() {
+    printf "\r${RED}✗${NC} %s\n" "$*" >&2
+}
+
+log_clear_line() {
+    printf "\r\033[K"
+}
+
+# ------------------------------
+# Package config functions
+# ------------------------------
+
+# Default values for package config
+declare -g PACKAGE_DIR=""
+declare -g name=""
+declare -g description=""
+declare -g version=""
+declare -g method="stow"
+declare -g fold=false
+declare -g depends=()
+declare -g requires_commands=()
+declare -g supported_os=()
+declare -g ignore=()
+
+reset_package_config() {
+    PACKAGE_DIR=""
+    name=""
+    description=""
+    version=""
+    method="stow"
+    fold=false
+    depends=()
+    requires_commands=()
+    supported_os=()
+    ignore=()
+    
+    # Unset hook functions if they exist
+    for hook in preinstall postinstall preuninstall postuninstall custom_install custom_uninstall validate; do
+        if declare -f "${hook}" &>/dev/null; then
+            unset -f "${hook}"
+        fi
+    done
+}
+
+load_package_config() {
+    local pkg="$1"
+    local config_file="${PKGS_SOURCE}/${pkg}/${CONFIG_FILE}"
+    
+    reset_package_config
+    
+    PACKAGE_DIR="${PKGS_SOURCE}/${pkg}"
+    
+    if [[ ! -f "${config_file}" ]]; then
+        log_debug "No ${CONFIG_FILE} found for '${pkg}', using defaults"
+        name="${pkg}"
+        return 0
+    fi
+    
+    log_debug "Loading config from ${config_file}"
+    
+    # Source the config file in a subshell first to validate
+    if ! bash -n "${config_file}" 2>/dev/null; then
+        log_error "Syntax error in ${config_file}"
+        return 1
+    fi
+    
+    # Source the config file
+    # shellcheck disable=SC1090
+    source "${config_file}"
+    
+    # Set default name if not provided
+    [[ -z "${name}" ]] && name="${pkg}"
+    
+    log_debug "Package config loaded: method=${method}, fold=${fold}"
+    
+    return 0
+}
+
+check_dependencies() {
+    local pkg="$1"
+    
+    # Check package dependencies
+    if [[ ${#depends[@]} -gt 0 ]]; then
+        log_verbose "Checking dependencies: ${depends[*]}"
+        for dep in "${depends[@]}"; do
+            if [[ ! -d "${PKGS_SOURCE}/${dep}" ]]; then
+                log_error "Missing dependency '${dep}' for package '${pkg}'"
+                return 1
+            fi
+        done
+    fi
+    
+    # Check command dependencies
+    if [[ ${#requires_commands[@]} -gt 0 ]]; then
+        log_verbose "Checking required commands: ${requires_commands[*]}"
+        for cmd in "${requires_commands[@]}"; do
+            if ! command -v "${cmd}" &>/dev/null; then
+                log_error "Required command '${cmd}' not found for package '${pkg}'"
+                return 1
+            fi
+        done
+    fi
+    
+    # Check OS compatibility
+    if [[ ${#supported_os[@]} -gt 0 ]]; then
+        local current_os
+        current_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        
+        local supported=false
+        for os in "${supported_os[@]}"; do
+            if [[ "${current_os}" == "${os}"* ]]; then
+                supported=true
+                break
+            fi
+        done
+        
+        if [[ "${supported}" == false ]]; then
+            log_error "Package '${pkg}' not supported on ${current_os}"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+run_hook() {
+    local hook_name="$1"
+    
+    # Check if hook function exists
+    if ! declare -f "${hook_name}" &>/dev/null; then
+        log_debug "Hook ${hook_name} not defined"
+        return 0
+    fi
+    
+    if [[ "${SKIP_HOOKS}" == true ]]; then
+        log_verbose "Skipping hook: ${hook_name}"
+        return 0
+    fi
+    
+    log_info "Running hook: ${hook_name}"
+    
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_verbose "Would execute: ${hook_name}()"
+        return 0
+    fi
+    
+    # Execute the hook in a subshell to contain any errors
+    if (
+        set -euo pipefail
+        "${hook_name}"
+    ); then
+        log_success "Hook ${hook_name} completed"
+        return 0
+    else
+        local exit_code=$?
+        log_error "Hook ${hook_name} failed with exit code ${exit_code}"
+        return "${exit_code}"
+    fi
+}
+
+# ------------------------------
+# Stow wrapper
+# ------------------------------
+
+stow_package() {
+    local action="$1"  # -S for install, -D for uninstall
+    local pkg="$2"
+    
+    local action_name="stowing"
+    [[ "${action}" == "-D" ]] && action_name="unstowing"
+    
+    # Build ignore pattern - always start with auto-ignored files
+    local ignore_pattern="${AUTO_IGNORE}"
+    
+    # Add patterns from package.conf ignore array
+    if [[ ${#ignore[@]} -gt 0 ]]; then
+        log_debug "Package ignore patterns: ${ignore[*]}"
+        for pattern in "${ignore[@]}"; do
+            ignore_pattern="${ignore_pattern}|${pattern}"
+        done
+    fi
+    
+    local stow_args=(
+        -t "${PKGS_TARGET}"
+        "${action}"
+        "${pkg}"
+        --ignore="${ignore_pattern}"
+    )
+    
+    # Add folding option
+    if [[ "${fold}" == false ]]; then
+        stow_args+=(--no-folding)
+    fi
+    
+    [[ "${VERBOSE}" == true ]] && stow_args+=(--verbose)
+    
+    if [[ "${DRY_RUN}" == true ]]; then
+        stow_args+=(--simulate)
+    fi
+    
+    log_verbose "Running: stow ${stow_args[*]}"
+    log_debug "Ignore pattern: ${ignore_pattern}"
+
+    # Capture stow output
+    local stow_output
+    if [[ "${VERBOSE}" == true ]]; then
+        # In verbose mode, show all output
+        if stow "${stow_args[@]}" 2>&1; then
+            return 0
+        else
+            return 1
+        fi
+    else
+        # In compact mode, capture output and only show on error
+        if stow_output=$(stow "${stow_args[@]}" 2>&1); then
+            return 0
+        else
+            # Show error output
+            echo
+            log_error "Stow ${action_name} failed:"
+            echo "${stow_output}"
+            return 1
+        fi
+    fi
+}
+
+# ------------------------------
+# Package operations
+# ------------------------------
+
+is_valid_package() {
+    local pkg="$1"
+
+    if [[ ! -d "${PKGS_SOURCE}/${pkg}" ]]; then
+        if [[ "${VERBOSE}" == true ]]; then
+            log_error "Package '${pkg}' does not exist"
+        else
+            log_inline_error "${pkg}: Package does not exist"
+        fi
+        return 1
+    fi
+
+    if [[ "${pkg}" =~ ^\. ]]; then
+        if [[ "${VERBOSE}" == true ]]; then
+            log_warn "Package '${pkg}' starts with a dot, skipping"
+        else
+            log_inline_error "${pkg}: Package starts with a dot, skipping"
+        fi
+        return 1
+    fi
+
+    return 0
+}
+
+get_available_packages() {
+    local packages=()
+    while IFS= read -r -d '' dir; do
+        local pkg
+        pkg="$(basename "${dir}")"
+        [[ "${pkg}" =~ ^\. ]] && continue
+        packages+=("${pkg}")
+    done < <(find "${PKGS_SOURCE}" -maxdepth 1 -type d -print0)
+    printf '%s\n' "${packages[@]}" | sort
+}
+
+install_package() {
+    local pkg="$1"
+
+    # Compact mode: inline progress
+    if [[ "${VERBOSE}" == true ]]; then
+        log_info "Installing package '${pkg}'"
+    else
+        log_inline "${pkg}: Loading config..."
+    fi
+
+    # Load package config
+    load_package_config "${pkg}" || {
+        [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Failed to load config"
+        return 1
+    }
+
+    # Show package info
+    if [[ -n "${description}" ]]; then
+        log_verbose "Description: ${description}"
+    fi
+    if [[ -n "${version}" ]]; then
+        log_verbose "Version: ${version}"
+    fi
+
+    # Check dependencies
+    [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Checking dependencies..."
+    check_dependencies "${pkg}" || {
+        [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Dependency check failed"
+        return 1
+    }
+
+    # Pre-install hook
+    if declare -f "preinstall" &>/dev/null; then
+        [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Running preinstall hook..."
+        run_hook "preinstall" || {
+            [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Preinstall hook failed"
+            return 1
+        }
+    fi
+
+    # Install based on method
+    [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Installing..."
+    case "${method}" in
+        stow)
+            stow_package "-S" "${pkg}" || {
+                [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Installation failed"
+                return 1
+            }
+            ;;
+        script)
+            if declare -f "custom_install" &>/dev/null; then
+                if [[ "${VERBOSE}" == true ]]; then
+                    log_info "Using custom install method"
+                fi
+                if [[ "${DRY_RUN}" == true ]]; then
+                    log_verbose "Would execute: custom_install()"
+                else
+                    run_hook "custom_install" || {
+                        [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Custom install failed"
+                        return 1
+                    }
+                fi
+            else
+                [[ "${VERBOSE}" == false ]] && echo
+                log_error "method='script' but custom_install() not defined"
+                return 1
+            fi
+            ;;
+        *)
+            [[ "${VERBOSE}" == false ]] && echo
+            log_error "Unknown installation method: ${method}"
+            return 1
+            ;;
+    esac
+
+    # Post-install hook
+    if declare -f "postinstall" &>/dev/null; then
+        [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Running postinstall hook..."
+        run_hook "postinstall" || {
+            [[ "${VERBOSE}" == false ]] && echo
+            log_warn "Post-install hook failed, but continuing..."
+        }
+    fi
+
+    # Validation
+    if [[ "${VALIDATE_INSTALL}" == true ]] && declare -f "validate" &>/dev/null; then
+        [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Validating..."
+        if [[ "${VERBOSE}" == true ]]; then
+            log_info "Validating installation..."
+        fi
+        if run_hook "validate"; then
+            [[ "${VERBOSE}" == true ]] && log_success "Validation passed"
+        else
+            [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Validation failed"
+            [[ "${VERBOSE}" == true ]] && log_error "Validation failed"
+            return 1
+        fi
+    fi
+
+    log_inline_success "${pkg}: Installed successfully"
+    return 0
+}
+
+uninstall_package() {
+    local pkg="$1"
+
+    # Compact mode: inline progress
+    if [[ "${VERBOSE}" == true ]]; then
+        log_info "Uninstalling package '${pkg}'"
+    else
+        log_inline "${pkg}: Loading config..."
+    fi
+
+    # Load package config
+    load_package_config "${pkg}" || {
+        [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Failed to load config"
+        return 1
+    }
+
+    # Pre-uninstall hook
+    if declare -f "preuninstall" &>/dev/null; then
+        [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Running preuninstall hook..."
+        run_hook "preuninstall" || {
+            [[ "${VERBOSE}" == false ]] && echo
+            log_warn "Pre-uninstall hook failed, but continuing..."
+        }
+    fi
+
+    # Uninstall based on method
+    [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Uninstalling..."
+    case "${method}" in
+        stow)
+            stow_package "-D" "${pkg}" || {
+                [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Uninstallation failed"
+                return 1
+            }
+            ;;
+        script)
+            if declare -f "custom_uninstall" &>/dev/null; then
+                if [[ "${VERBOSE}" == true ]]; then
+                    log_info "Using custom uninstall method"
+                fi
+                if [[ "${DRY_RUN}" == true ]]; then
+                    log_verbose "Would execute: custom_uninstall()"
+                else
+                    run_hook "custom_uninstall" || {
+                        [[ "${VERBOSE}" == false ]] && log_inline_error "${pkg}: Custom uninstall failed"
+                        return 1
+                    }
+                fi
+            else
+                [[ "${VERBOSE}" == false ]] && echo
+                log_warn "method='script' but custom_uninstall() not defined, skipping"
+            fi
+            ;;
+        *)
+            [[ "${VERBOSE}" == false ]] && echo
+            log_error "Unknown installation method: ${method}"
+            return 1
+            ;;
+    esac
+
+    # Post-uninstall hook
+    if declare -f "postuninstall" &>/dev/null; then
+        [[ "${VERBOSE}" == false ]] && log_inline "${pkg}: Running postuninstall hook..."
+        run_hook "postuninstall" || {
+            [[ "${VERBOSE}" == false ]] && echo
+            log_warn "Post-uninstall hook failed, but continuing..."
+        }
+    fi
+
+    log_inline_success "${pkg}: Uninstalled successfully"
+    return 0
+}
+
+# ------------------------------
+# Commands
+# ------------------------------
+
+cmd_install() {
+    local packages=("$@")
+    
+    if [[ ${#packages[@]} -eq 0 ]]; then
+        log_warn "No packages specified. Available packages:"
+        get_available_packages | sed 's/^/  • /'
+        return 1
+    fi
+    
+    if [[ "${packages[0]}" == "*" ]]; then
+        mapfile -t packages < <(get_available_packages)
+    fi
+    
+    command -v stow &>/dev/null || die "stow is not installed"
+    
+    [[ ! -d "${PKGS_TARGET}" ]] && mkdir -p "${PKGS_TARGET}"
+    
+    local failed=()
+    local installed=()
+    
+    for pkg in "${packages[@]}"; do
+        is_valid_package "${pkg}" || {
+            failed+=("${pkg}")
+            continue
+        }
+
+        # Use dependency resolver to auto-install dependencies
+        if pkg_install_with_deps "${pkg}"; then
+            installed+=("${pkg}")
+        else
+            failed+=("${pkg}")
+        fi
+
+        # Blank line between packages in verbose mode only
+        [[ "${VERBOSE}" == true ]] && echo
+    done
+    
+    # Summary
+    echo
+    log_info "Installation Summary"
+    echo "─────────────────────────────────"
+    
+    if [[ ${#installed[@]} -gt 0 ]]; then
+        log_success "Installed (${#installed[@]}): ${installed[*]}"
+    fi
+    
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        log_error "Failed (${#failed[@]}): ${failed[*]}"
+        return 1
+    fi
+    
+    log_success "All packages installed successfully!"
+}
+
+cmd_uninstall() {
+    local packages=("$@")
+    
+    if [[ ${#packages[@]} -eq 0 ]]; then
+        log_error "No packages specified"
+        return 1
+    fi
+    
+    if [[ "${packages[0]}" == "*" ]]; then
+        mapfile -t packages < <(get_available_packages)
+    fi
+    
+    command -v stow &>/dev/null || die "stow is not installed"
+    
+    local failed=()
+    local uninstalled=()
+    
+    for pkg in "${packages[@]}"; do
+        is_valid_package "${pkg}" || {
+            failed+=("${pkg}")
+            continue
+        }
+        
+        if uninstall_package "${pkg}"; then
+            uninstalled+=("${pkg}")
+        else
+            failed+=("${pkg}")
+        fi
+
+        # Blank line between packages in verbose mode only
+        [[ "${VERBOSE}" == true ]] && echo
+    done
+    
+    # Summary
+    echo
+    log_info "Uninstallation Summary"
+    echo "─────────────────────────────────"
+    
+    if [[ ${#uninstalled[@]} -gt 0 ]]; then
+        log_success "Uninstalled (${#uninstalled[@]}): ${uninstalled[*]}"
+    fi
+    
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        log_error "Failed (${#failed[@]}): ${failed[*]}"
+        return 1
+    fi
+    
+    log_success "All packages uninstalled successfully!"
+}
+
+cmd_reinstall() {
+    local packages=("$@")
+    
+    log_info "=== UNINSTALL PHASE ==="
+    cmd_uninstall "${packages[@]}" || return 1
+    
+    echo
+    echo
+    log_info "=== INSTALL PHASE ==="
+    cmd_install "${packages[@]}" || return 1
+}
+
+cmd_list() {
+    log_info "Available packages:"
+    echo
+    
+    local packages
+    mapfile -t packages < <(get_available_packages)
+    
+    if [[ ${#packages[@]} -eq 0 ]]; then
+        log_warn "No packages found in ${PKGS_SOURCE}"
+        return 0
+    fi
+    
+    for pkg in "${packages[@]}"; do
+        if load_package_config "${pkg}" 2>/dev/null; then
+            printf "  ${GREEN}•${NC} %-20s" "${pkg}"
+            [[ -n "${description}" ]] && printf " - %s" "${description}"
+            [[ -n "${version}" ]] && printf " ${CYAN}(v%s)${NC}" "${version}"
+            printf "\n"
+        else
+            printf "  ${YELLOW}•${NC} %-20s ${RED}(invalid config)${NC}\n" "${pkg}"
+        fi
+    done
+}
+
+cmd_info() {
+    local pkg="$1"
+    
+    [[ -z "${pkg}" ]] && {
+        log_error "Package name required"
+        return 1
+    }
+    
+    is_valid_package "${pkg}" || return 1
+    
+    load_package_config "${pkg}" || return 1
+    
+    echo
+    log_info "Package Information: ${pkg}"
+    echo "─────────────────────────────────"
+    [[ -n "${name}" ]] && echo "Name:        ${name}"
+    [[ -n "${description}" ]] && echo "Description: ${description}"
+    [[ -n "${version}" ]] && echo "Version:     ${version}"
+    echo "Method:      ${method}"
+    echo "Folding:     ${fold}"
+    
+    if [[ ${#depends[@]} -gt 0 ]]; then
+        echo "Dependencies: ${depends[*]}"
+    fi
+    
+    if [[ ${#requires_commands[@]} -gt 0 ]]; then
+        echo "Required:    ${requires_commands[*]}"
+    fi
+    
+    if [[ ${#supported_os[@]} -gt 0 ]]; then
+        echo "Supported:   ${supported_os[*]}"
+    fi
+    
+    # Show ignore patterns
+    echo "Auto-ignore: ${AUTO_IGNORE}"
+    if [[ ${#ignore[@]} -gt 0 ]]; then
+        echo "Custom ignore: ${ignore[*]}"
+    fi
+    
+    echo
+    echo "Available hooks:"
+    for hook in preinstall postinstall preuninstall postuninstall custom_install custom_uninstall validate; do
+        if declare -f "${hook}" &>/dev/null; then
+            echo "  ${GREEN}✓${NC} ${hook}"
+        else
+            echo "  ${YELLOW}○${NC} ${hook}"
+        fi
+    done
+    echo
+}
+
+cmd_help() {
+    print_colored "${GREEN}pkg-cli v${PKG_CLI_VERSION}${NC} - Standalone Package Manager for pkgs Ecosystem"
+    echo
+    print_colored "${BLUE}Usage:${NC}"
+    echo "  pkg-cli [options] <command> [packages...]"
+    echo
+    print_colored "${BLUE}Commands:${NC}"
+    cat <<'EOF'
+  install, i      Install packages
+  uninstall, u    Uninstall packages
+  reinstall, r    Reinstall packages
+  list, ls        List available packages with descriptions
+  info <pkg>      Show detailed package information
+  doctor          Run system health checks
+  help, h         Show this help
+
+EOF
+    print_colored "${BLUE}GitHub Commands (Stubs - Full implementation post-Phase 4):${NC}"
+    cat <<'EOF'
+  clone <pkg>     Clone package from GitHub (stub)
+  update [pkg]    Update package from GitHub (stub)
+  remote          List remote packages (stub)
+
+EOF
+    print_colored "${BLUE}Options:${NC}"
+    cat <<'EOF'
+  -n, --dry-run       Show what would happen without making changes
+  -v, --verbose       Show detailed output
+  -s, --skip-hooks    Skip all hooks (pre/post install/uninstall)
+  --no-validate       Skip validation after installation
+  --source <path>     Override packages source directory (default: script dir)
+  --target <path>     Override installation target directory (default: $HOME)
+  -h, --help          Show this help
+
+EOF
+    print_colored "${BLUE}Examples:${NC}"
+    cat <<'EOF'
+  pkg-cli install @core/lib @system/audio
+  pkg-cli -n install '*'                      # Dry-run install all
+  pkg-cli -v reinstall @apps/player
+  pkg-cli info @core/lib                      # Show package details
+  pkg-cli list                                # List all packages
+  pkg-cli doctor                              # Run health checks
+  pkg-cli --source /path/to/test-pkgs list    # Use different package dir
+  PKGS_SOURCE=/tmp/test pkg-cli install test  # Via environment variable
+
+EOF
+    print_colored "${BLUE}Package Structure:${NC}"
+    cat <<'EOF'
+  package-name/
+    ├── package.conf      # Single config file (optional, auto-ignored)
+    ├── .config/          # Config files to stow
+    ├── .local/           # Local files to stow
+    └── ...               # Other files/directories
+
+EOF
+    print_colored "${BLUE}Package Config Format (package.conf):${NC}"
+    echo
+    print_colored "  ${CYAN}# Metadata${NC}"
+    cat <<'EOF'
+  name="package-name"
+  description="Package description"
+  version="1.0.0"
+  
+EOF
+    print_colored "  ${CYAN}# Installation${NC}"
+    cat <<'EOF'
+  method="stow"         # or "script"
+  fold=false            # Enable folder folding
+  
+EOF
+    print_colored "  ${CYAN}# Dependencies${NC}"
+    cat <<'EOF'
+  depends=("pkg1" "pkg2")
+  requires_commands=("git" "curl")
+  supported_os=("linux" "darwin")
+  
+EOF
+    print_colored "  ${CYAN}# Ignore patterns (Perl regex, package.conf always auto-ignored)${NC}"
+    cat <<'EOF'
+  ignore=("README.md" "docs" ".*\.backup" "screenshots")
+  
+EOF
+    print_colored "  ${CYAN}# Hooks (bash functions)${NC}"
+    cat <<'EOF'
+  preinstall() { ... }
+  postinstall() { ... }
+  preuninstall() { ... }
+  postuninstall() { ... }
+  
+EOF
+    print_colored "  ${CYAN}# Custom install (if method=\"script\")${NC}"
+    cat <<'EOF'
+  custom_install() { ... }
+  custom_uninstall() { ... }
+  
+EOF
+    print_colored "  ${CYAN}# Validation${NC}"
+    cat <<'EOF'
+  validate() { ... }
+
+EOF
+    print_colored "${BLUE}Ignore Patterns:${NC}"
+    cat <<'EOF'
+  Patterns use Perl regex syntax (used by stow --ignore):
+    ignore=("README.md")              # Exact filename
+    ignore=(".*\.md")                 # All .md files
+    ignore=("docs")                   # Directory named 'docs'
+    ignore=("test.*" ".*~")           # Multiple patterns in array
+
+  Common patterns:
+    "README.md" "LICENSE" "TODO.md"       # Documentation
+    "docs" "examples" "screenshots"       # Directories
+    ".*\.backup" ".*\.bak" ".*~"          # Backup files
+    "\.git.*" "\.github"                  # Git files
+    "test" ".*\.test\..*"                 # Test files
+    "Makefile" ".*\.mk"                   # Build files
+
+  Note: package.conf is always automatically ignored
+
+EOF
+    print_colored "${BLUE}More info:${NC}"
+    echo "  See example packages for complete configuration examples"
+    echo
+}
+
+# ------------------------------
+# GitHub Integration (Stubs)
+# ------------------------------
+
+cmd_clone() {
+    log_warn "GitHub integration coming in post-Phase 4"
+    echo
+    print_colored "${YELLOW}TODO:${NC} Clone package from GitHub"
+    echo "  Will support: pkg-cli clone @core/lib"
+    echo "  Repository: github.com/andronics/pkg-core-lib"
+    echo
+    echo "For now, manually clone packages to ${PKGS_SOURCE}/"
+    return 1
+}
+
+cmd_update() {
+    log_warn "GitHub integration coming in post-Phase 4"
+    echo
+    print_colored "${YELLOW}TODO:${NC} Update package from GitHub"
+    echo "  Will support: pkg-cli update @core/lib"
+    echo "  Will run: git pull in package directory"
+    echo
+    echo "For now, manually pull updates in package directories"
+    return 1
+}
+
+cmd_remote() {
+    log_warn "GitHub integration coming in post-Phase 4"
+    echo
+    print_colored "${YELLOW}TODO:${NC} List remote packages"
+    echo "  Will support: pkg-cli remote list"
+    echo "  Will query: github.com/andronics/pkg-* repositories"
+    echo
+    echo "For now, check GitHub directly at:"
+    echo "  https://github.com/andronics?tab=repositories"
+    return 1
+}
+
+# ------------------------------
+# Dependency Resolution
+# ------------------------------
+
+pkg_resolve_deps() {
+    local package="$1"
+    local pkg_dir="${PKGS_SOURCE}/${package}"
+    local conf="${pkg_dir}/${CONFIG_FILE}"
+
+    [[ ! -f "$conf" ]] && return 0
+
+    # Reset and load package config
+    reset_package_config
+    source "$conf" || return 0
+
+    # Return dependencies
+    echo "${depends[@]:-}"
+}
+
+pkg_install_with_deps() {
+    local package="$1"
+    local -a deps
+
+    # Get dependencies
+    mapfile -t deps < <(pkg_resolve_deps "$package")
+
+    # Install dependencies first
+    for dep in "${deps[@]}"; do
+        [[ -z "$dep" ]] && continue
+
+        # Check if already installed (has stowed symlinks)
+        if ! is_package_installed "$dep"; then
+            log_info "Installing dependency: ${CYAN}${dep}${NC}"
+            pkg_install_with_deps "$dep"  # Recursive
+        else
+            log_verbose "Dependency already installed: ${dep}"
+        fi
+    done
+
+    # Install the package itself
+    install_package "$package"
+}
+
+is_package_installed() {
+    local package="$1"
+    local pkg_dir="${PKGS_SOURCE}/${package}"
+
+    # Simple check: does the package directory exist in target?
+    # More sophisticated: check for actual symlinks
+    # For now, just check if stow created anything
+    [[ -d "$pkg_dir" ]] || return 1
+
+    # TODO: More sophisticated check for actual symlinks
+    return 1  # Assume not installed for safety
+}
+
+# ------------------------------
+# Doctor Command
+# ------------------------------
+
+cmd_doctor() {
+    local issues=0
+
+    print_colored "${GREEN}Running system health checks...${NC}"
+    echo
+
+    # Check 1: stow installation
+    print_colored "${BLUE}[1/7]${NC} Checking for GNU stow..."
+    if command -v stow &>/dev/null; then
+        local stow_version
+        stow_version="$(stow --version 2>&1 | head -1)"
+        log_success "stow found: ${stow_version}"
+    else
+        log_error "stow not found - install with: sudo pacman -S stow"
+        ((issues++))
+    fi
+    echo
+
+    # Check 2: PKGS_SOURCE exists
+    print_colored "${BLUE}[2/7]${NC} Checking package source directory..."
+    if [[ -d "${PKGS_SOURCE}" ]]; then
+        local pkg_count
+        pkg_count="$(find "${PKGS_SOURCE}" -maxdepth 1 -type d | wc -l)"
+        ((pkg_count--))  # Subtract the source dir itself
+        log_success "Source directory exists: ${PKGS_SOURCE} (${pkg_count} packages)"
+    else
+        log_error "Source directory not found: ${PKGS_SOURCE}"
+        ((issues++))
+    fi
+    echo
+
+    # Check 3: package.conf validity
+    print_colored "${BLUE}[3/7]${NC} Validating package.conf files..."
+    local invalid_configs=0
+    while IFS= read -r -d '' conf; do
+        if ! bash -n "$conf" 2>/dev/null; then
+            log_error "Invalid syntax: ${conf}"
+            ((invalid_configs++))
+        fi
+    done < <(find "${PKGS_SOURCE}" -maxdepth 2 -name "package.conf" -print0 2>/dev/null)
+
+    if [[ $invalid_configs -eq 0 ]]; then
+        log_success "All package.conf files have valid syntax"
+    else
+        log_error "Found ${invalid_configs} invalid package.conf files"
+        ((issues += invalid_configs))
+    fi
+    echo
+
+    # Check 4: broken symlinks
+    print_colored "${BLUE}[4/7]${NC} Checking for broken symlinks..."
+    local broken_links=0
+    while IFS= read -r link; do
+        ((broken_links++))
+        log_warn "Broken symlink: ${link}"
+    done < <(find "${PKGS_TARGET}" -xtype l 2>/dev/null)
+
+    if [[ $broken_links -eq 0 ]]; then
+        log_success "No broken symlinks found"
+    else
+        log_warn "Found ${broken_links} broken symlinks (may be from other tools)"
+    fi
+    echo
+
+    # Check 5: required commands
+    print_colored "${BLUE}[5/7]${NC} Checking for commonly required commands..."
+    local -a required_commands=("git" "curl" "zsh" "bash")
+    local missing_commands=0
+
+    for cmd in "${required_commands[@]}"; do
+        if command -v "$cmd" &>/dev/null; then
+            log_verbose "${GREEN}✓${NC} $cmd found"
+        else
+            log_warn "Command not found: $cmd"
+            ((missing_commands++))
+        fi
+    done
+
+    if [[ $missing_commands -eq 0 ]]; then
+        log_success "All common commands found"
+    else
+        log_warn "${missing_commands} common commands missing (may not be required)"
+    fi
+    echo
+
+    # Check 6: lib package structure
+    print_colored "${BLUE}[6/7]${NC} Checking @core/lib package structure..."
+    if [[ -d "${PKGS_SOURCE}/lib/.local/bin/lib-load" ]]; then
+        log_success "lib-load found (Phase 1 restructure complete)"
+    elif [[ -f "${PKGS_SOURCE}/lib/.local/bin/lib-load" ]]; then
+        log_success "lib-load found (Phase 1 restructure complete)"
+    else
+        log_warn "lib-load not found - Phase 1 may not be complete"
+    fi
+    echo
+
+    # Check 7: PATH configuration
+    print_colored "${BLUE}[7/7]${NC} Checking PATH configuration..."
+    if [[ ":$PATH:" == *":${HOME}/.pkg-cli/bin:"* ]]; then
+        log_success "pkg-cli is in PATH"
+    else
+        log_warn "pkg-cli not in PATH"
+        echo "  Add to ~/.zshrc or ~/.bashrc:"
+        echo "    export PATH=\"\$HOME/.pkg-cli/bin:\$PATH\""
+    fi
+    echo
+
+    # Summary
+    print_colored "${GREEN}Health check complete${NC}"
+    if [[ $issues -eq 0 ]]; then
+        log_success "No critical issues found"
+        return 0
+    else
+        log_error "Found ${issues} critical issue(s)"
+        return 1
+    fi
+}
+
+# ------------------------------
+# Main
+# ------------------------------
+
+main() {
+    local command=""
+    local packages=()
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=true
+                log_warn "DRY RUN MODE - No changes will be made"
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -s|--skip-hooks)
+                SKIP_HOOKS=true
+                shift
+                ;;
+            --no-validate)
+                VALIDATE_INSTALL=false
+                shift
+                ;;
+            --source)
+                PKGS_SOURCE="$2"
+                shift 2
+                ;;
+            --target)
+                PKGS_TARGET="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cmd_help
+                exit 0
+                ;;
+            i|install|u|uninstall|r|reinstall|ls|list|info|h|help|doctor|clone|update|remote)
+                command="$1"
+                shift
+                break
+                ;;
+            -*)
+                die "Unknown option: $1"
+                ;;
+            *)
+                die "Unknown command: $1. Use 'help' for usage."
+                ;;
+        esac
+    done
+
+    packages=("$@")
+
+    [[ -z "${command}" ]] && {
+        cmd_help
+        die "No command specified"
+    }
+
+    # For commands that don't need to be in PKGS_SOURCE
+    case "${command}" in
+        doctor|h|help|clone|update|remote)
+            # These commands don't require being in PKGS_SOURCE
+            ;;
+        *)
+            cd "${PKGS_SOURCE}" || die "Failed to change to ${PKGS_SOURCE}"
+            ;;
+    esac
+
+    case "${command}" in
+        i|install) cmd_install "${packages[@]}" ;;
+        u|uninstall) cmd_uninstall "${packages[@]}" ;;
+        r|reinstall) cmd_reinstall "${packages[@]}" ;;
+        ls|list) cmd_list ;;
+        info) cmd_info "${packages[@]}" ;;
+        doctor) cmd_doctor ;;
+        clone) cmd_clone "${packages[@]}" ;;
+        update) cmd_update "${packages[@]}" ;;
+        remote) cmd_remote "${packages[@]}" ;;
+        h|help) cmd_help ;;
+        *) die "Unknown command: ${command}" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
