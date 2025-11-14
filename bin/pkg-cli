@@ -46,7 +46,8 @@ readonly MAGENTA='\033[0;35m'
 readonly NC='\033[0m'
 
 # Configurable paths (can be overridden via environment variables)
-PKGS_SOURCE="${PKGS_SOURCE:-${HOME}/.pkgs}"       # Default to ~/.pkgs
+PKGS_SOURCE="${PKGS_SOURCE:-${HOME}/.pkgs}"       # Default to ~/.pkgs (local packages)
+PKGS_REMOTE_DIR="${PKGS_REMOTE_DIR:-${HOME}/.local-packages}"  # Remote packages directory
 PKGS_TARGET="${PKGS_TARGET:-${HOME}}"             # Default to $HOME
 PKGS_GITHUB_USER="${PKGS_GITHUB_USER:-andronics}" # Default to andronics, override for forks
 PKGS_GITHUB_URL="${PKGS_GITHUB_URL:-https://github.com}"  # Default to github.com, supports mirrors
@@ -755,11 +756,13 @@ cmd_help() {
   help, h         Show this help
 
 EOF
-    print_colored "${BLUE}GitHub Commands (Stubs - Full implementation post-Phase 4):${NC}"
+    print_colored "${BLUE}GitHub Commands (Phase 9):${NC}"
     cat <<'EOF'
-  clone <pkg>     Clone package from GitHub (stub)
-  update [pkg]    Update package from GitHub (stub)
-  remote          List remote packages (stub)
+  remote          List all remote packages on GitHub
+  clone <pkg>     Clone and install package from GitHub
+  update <pkg>    Update package from GitHub
+  search <query>  Search for packages
+  upgrade         Check for and install updates for all packages
 
 EOF
     print_colored "${BLUE}Options:${NC}"
@@ -781,6 +784,11 @@ EOF
   pkg-cli info @core/lib                      # Show package details
   pkg-cli list                                # List all packages
   pkg-cli doctor                              # Run health checks
+  pkg-cli remote                              # List all remote packages
+  pkg-cli clone @core/lib                     # Clone and install from GitHub
+  pkg-cli update @core/lib                    # Update package from GitHub
+  pkg-cli search audio                        # Search for packages
+  pkg-cli upgrade                             # Check for updates
   pkg-cli --source /path/to/test-pkgs list    # Use different package dir
   PKGS_SOURCE=/tmp/test pkg-cli install test  # Via environment variable
 
@@ -865,58 +873,458 @@ EOF
 }
 
 # ------------------------------
-# GitHub Integration (Stubs)
+# GitHub Integration (Phase 9)
 # ------------------------------
 
-cmd_clone() {
-    log_warn "GitHub integration coming in post-Phase 4"
-    echo
-    print_colored "${YELLOW}TODO:${NC} Clone package from GitHub"
-    echo "  Will support: pkg-cli clone @core/lib"
-    echo
-    echo "  Example implementation (post-Phase 4):"
-    echo "    Repository: ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/pkg-core-lib"
-    echo "    Command: git clone ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/pkg-core-lib ${PKGS_SOURCE}/lib"
-    echo
-    echo "  Configuration (environment variables):"
-    echo "    PKGS_GITHUB_USER=${PKGS_GITHUB_USER} (override for forks)"
-    echo "    PKGS_GITHUB_URL=${PKGS_GITHUB_URL} (override for mirrors)"
-    echo
-    echo "For now, manually clone packages to ${PKGS_SOURCE}/"
-    return 1
+# Helper: Parse package name (@collection/name or pkg-collection-name)
+parse_package_name() {
+    local input="$1"
+    local collection=""
+    local name=""
+    local repo_name=""
+
+    if [[ "$input" =~ ^@([^/]+)/(.+)$ ]]; then
+        # Format: @collection/name
+        collection="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]}"
+        repo_name="pkg-${collection}-${name}"
+    elif [[ "$input" =~ ^pkg-([^-]+)-(.+)$ ]]; then
+        # Format: pkg-collection-name
+        collection="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]}"
+        repo_name="$input"
+    else
+        # Assume it's just a name, try to find it
+        name="$input"
+        repo_name=""
+    fi
+
+    echo "${collection}:${name}:${repo_name}"
 }
 
-cmd_update() {
-    log_warn "GitHub integration coming in post-Phase 4"
-    echo
-    print_colored "${YELLOW}TODO:${NC} Update package from GitHub"
-    echo "  Will support: pkg-cli update @core/lib"
-    echo
-    echo "  Example implementation (post-Phase 4):"
-    echo "    Command: git -C ${PKGS_SOURCE}/lib pull"
-    echo
-    echo "For now, manually pull updates in package directories:"
-    echo "  cd ${PKGS_SOURCE}/lib && git pull"
-    return 1
+# Helper: Get repository URL for a package
+get_repo_url() {
+    local pkg="$1"
+    local parsed
+    parsed="$(parse_package_name "$pkg")"
+
+    local collection="${parsed%%:*}"
+    local rest="${parsed#*:}"
+    local name="${rest%%:*}"
+    local repo_name="${rest#*:}"
+
+    if [[ -n "$repo_name" ]]; then
+        echo "${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/${repo_name}.git"
+    else
+        # Try to search for it
+        log_error "Could not determine repository for '${pkg}'"
+        return 1
+    fi
+}
+
+# Helper: Get local directory name from package
+get_local_dir() {
+    local pkg="$1"
+    local parsed
+    parsed="$(parse_package_name "$pkg")"
+
+    local repo_name="${parsed##*:}"
+
+    if [[ -n "$repo_name" ]]; then
+        echo "${repo_name}"
+    else
+        echo "$pkg"
+    fi
 }
 
 cmd_remote() {
-    log_warn "GitHub integration coming in post-Phase 4"
+    log_info "Fetching remote packages from GitHub..."
     echo
-    print_colored "${YELLOW}TODO:${NC} List remote packages"
-    echo "  Will support: pkg-cli remote list"
+
+    # Check if git is available
+    command -v git &>/dev/null || die "git is not installed"
+
+    # Use git ls-remote to list all repos (works without authentication)
+    log_verbose "Querying ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}..."
+
+    # Try to use gh CLI if available, otherwise use curl
+    local repos=()
+    if command -v gh &>/dev/null; then
+        log_verbose "Using gh CLI to list repositories..."
+        # Skip auth check, just try to list (works even without auth for public repos)
+        mapfile -t repos < <(gh repo list "${PKGS_GITHUB_USER}" --limit 1000 --json name --jq '.[].name' 2>/dev/null | grep '^pkg-' || true)
+    fi
+
+    # Fallback to curl if gh didn't work or isn't available
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        log_verbose "Using GitHub API via curl..."
+        if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+            mapfile -t repos < <(curl -s "https://api.github.com/users/${PKGS_GITHUB_USER}/repos?per_page=100&type=public" 2>/dev/null | jq -r '.[].name' | grep '^pkg-' || true)
+        elif command -v curl &>/dev/null; then
+            mapfile -t repos < <(curl -s "https://api.github.com/users/${PKGS_GITHUB_USER}/repos?per_page=100&type=public" 2>/dev/null | grep '"name":' | grep 'pkg-' | sed 's/.*"name": "\(pkg-[^"]*\)".*/\1/' || true)
+        fi
+    fi
+
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        log_warn "No remote packages found"
+        echo "  Check: ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}?tab=repositories"
+        return 0
+    fi
+
+    log_success "Found ${#repos[@]} remote packages:"
     echo
-    echo "  Example implementation (post-Phase 4):"
-    echo "    Query: ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}/pkg-* repositories"
-    echo "    Method: GitHub API or web scraping (no gh CLI required)"
+
+    # Group by collection
+    declare -A collections
+    for repo in "${repos[@]}"; do
+        if [[ "$repo" =~ ^pkg-([^-]+)- ]]; then
+            local coll="${BASH_REMATCH[1]}"
+            collections["$coll"]+="$repo "
+        fi
+    done
+
+    # Print by collection
+    for coll in $(echo "${!collections[@]}" | tr ' ' '\n' | sort); do
+        print_colored "${MAGENTA}@${coll}${NC}"
+        for repo in ${collections[$coll]}; do
+            local name="${repo#pkg-${coll}-}"
+            printf "  ${GREEN}•${NC} @${coll}/${name}\n"
+        done
+        echo
+    done
+
+    echo "Install with: ${CYAN}pkg-cli clone @collection/name${NC}"
+}
+
+cmd_clone() {
+    local pkg="$1"
+
+    [[ -z "$pkg" ]] && {
+        log_error "Package name required"
+        echo "Usage: pkg-cli clone @collection/name"
+        echo "Example: pkg-cli clone @core/lib"
+        return 1
+    }
+
+    # Check if git is available
+    command -v git &>/dev/null || die "git is not installed"
+    command -v stow &>/dev/null || die "stow is not installed"
+
+    # Get repository URL
+    local repo_url
+    repo_url="$(get_repo_url "$pkg")" || return 1
+
+    # Get local directory
+    local local_dir
+    local_dir="$(get_local_dir "$pkg")"
+
+    local target_dir="${PKGS_REMOTE_DIR}/${local_dir}"
+
+    log_info "Cloning package '${pkg}' from GitHub..."
+    log_verbose "Repository: ${repo_url}"
+    log_verbose "Target: ${target_dir}"
+
+    # Create remote packages directory if it doesn't exist
+    [[ ! -d "${PKGS_REMOTE_DIR}" ]] && {
+        log_verbose "Creating ${PKGS_REMOTE_DIR}..."
+        mkdir -p "${PKGS_REMOTE_DIR}"
+    }
+
+    # Check if already exists
+    if [[ -d "$target_dir" ]]; then
+        log_warn "Package already exists at ${target_dir}"
+        read -p "Overwrite? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Cancelled"
+            return 1
+        fi
+        rm -rf "$target_dir"
+    fi
+
+    # Clone the repository
+    log_inline "Cloning..."
+    if [[ "${VERBOSE}" == true ]]; then
+        git clone "$repo_url" "$target_dir" || {
+            log_error "Failed to clone repository"
+            return 1
+        }
+    else
+        if git clone -q "$repo_url" "$target_dir" 2>&1; then
+            log_inline_success "Cloned successfully"
+        else
+            log_inline_error "Failed to clone repository"
+            return 1
+        fi
+    fi
+
+    # Install with stow (using the pattern from Phase 8 testing)
+    log_info "Installing package..."
+
+    local stow_args=(
+        -d "${PKGS_REMOTE_DIR}"
+        -t "${PKGS_TARGET}"
+        --ignore='.*\.md'
+        --ignore='package\.conf'
+        --ignore='LICENSE'
+        --ignore='\.git.*'
+        "${local_dir}"
+    )
+
+    [[ "${VERBOSE}" == true ]] && stow_args+=(--verbose)
+    [[ "${DRY_RUN}" == true ]] && stow_args+=(--simulate)
+
+    log_verbose "Running: stow ${stow_args[*]}"
+
+    if stow "${stow_args[@]}" 2>&1; then
+        log_success "Package '${pkg}' installed successfully!"
+        echo
+        echo "Location: ${target_dir}"
+        return 0
+    else
+        log_error "Failed to install package with stow"
+        return 1
+    fi
+}
+
+cmd_update() {
+    local pkg="$1"
+
+    [[ -z "$pkg" ]] && {
+        log_error "Package name required"
+        echo "Usage: pkg-cli update @collection/name"
+        echo "Example: pkg-cli update @core/lib"
+        return 1
+    }
+
+    # Check if git is available
+    command -v git &>/dev/null || die "git is not installed"
+    command -v stow &>/dev/null || die "stow is not installed"
+
+    # Get local directory
+    local local_dir
+    local_dir="$(get_local_dir "$pkg")"
+
+    local target_dir="${PKGS_REMOTE_DIR}/${local_dir}"
+
+    if [[ ! -d "$target_dir" ]]; then
+        log_error "Package '${pkg}' not found at ${target_dir}"
+        echo "Install it first with: pkg-cli clone ${pkg}"
+        return 1
+    fi
+
+    if [[ ! -d "$target_dir/.git" ]]; then
+        log_error "Not a git repository: ${target_dir}"
+        return 1
+    fi
+
+    log_info "Updating package '${pkg}'..."
+    log_verbose "Location: ${target_dir}"
+
+    # First, unstow the package
+    log_inline "Unstowing..."
+    local stow_args=(
+        -d "${PKGS_REMOTE_DIR}"
+        -t "${PKGS_TARGET}"
+        -D
+        "${local_dir}"
+    )
+
+    if stow "${stow_args[@]}" 2>&1; then
+        log_inline_success "Unstowed"
+    else
+        log_inline_error "Failed to unstow (continuing anyway...)"
+    fi
+
+    # Pull updates
+    log_inline "Pulling updates..."
+    if [[ "${VERBOSE}" == true ]]; then
+        git -C "$target_dir" pull || {
+            log_error "Failed to pull updates"
+            return 1
+        }
+    else
+        if git -C "$target_dir" pull -q 2>&1; then
+            log_inline_success "Updated from GitHub"
+        else
+            log_inline_error "Failed to pull updates"
+            return 1
+        fi
+    fi
+
+    # Re-stow the package
+    log_inline "Re-stowing..."
+    stow_args=(
+        -d "${PKGS_REMOTE_DIR}"
+        -t "${PKGS_TARGET}"
+        --ignore='.*\.md'
+        --ignore='package\.conf'
+        --ignore='LICENSE'
+        --ignore='\.git.*'
+        "${local_dir}"
+    )
+
+    [[ "${VERBOSE}" == true ]] && stow_args+=(--verbose)
+
+    if stow "${stow_args[@]}" 2>&1; then
+        log_inline_success "Package '${pkg}' updated successfully!"
+        return 0
+    else
+        log_inline_error "Failed to re-stow package"
+        return 1
+    fi
+}
+
+cmd_search() {
+    local query="$1"
+
+    [[ -z "$query" ]] && {
+        log_error "Search query required"
+        echo "Usage: pkg-cli search <query>"
+        echo "Example: pkg-cli search audio"
+        return 1
+    }
+
+    log_info "Searching for '${query}'..."
     echo
-    echo "  Configuration (environment variables):"
-    echo "    PKGS_GITHUB_USER=${PKGS_GITHUB_USER}"
-    echo "    PKGS_GITHUB_URL=${PKGS_GITHUB_URL}"
+
+    # Search in remote packages
+    local repos=()
+    if command -v gh &>/dev/null; then
+        mapfile -t repos < <(gh repo list "${PKGS_GITHUB_USER}" --limit 1000 --json name,description --jq '.[] | select(.name | startswith("pkg-")) | "\(.name):\(.description)"' 2>/dev/null || true)
+    fi
+
+    # Fallback to curl if gh didn't work
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+            mapfile -t repos < <(curl -s "https://api.github.com/users/${PKGS_GITHUB_USER}/repos?per_page=100&type=public" 2>/dev/null | jq -r '.[] | select(.name | startswith("pkg-")) | "\(.name):\(.description)"' || true)
+        elif command -v curl &>/dev/null; then
+            mapfile -t repos < <(curl -s "https://api.github.com/users/${PKGS_GITHUB_USER}/repos?per_page=100&type=public" 2>/dev/null | grep -E '"name":|"description":' | paste - - | grep 'pkg-' | sed 's/.*"name": "\([^"]*\)".*"description": "\([^"]*\)".*/\1:\2/' || true)
+        fi
+    fi
+
+    local found=0
+    for repo_info in "${repos[@]}"; do
+        local repo="${repo_info%%:*}"
+        local desc="${repo_info#*:}"
+
+        # Search in name and description
+        if [[ "$repo" == *"$query"* ]] || [[ "$desc" == *"$query"* ]]; then
+            ((found++))
+
+            # Parse collection and name
+            if [[ "$repo" =~ ^pkg-([^-]+)-(.+)$ ]]; then
+                local coll="${BASH_REMATCH[1]}"
+                local name="${BASH_REMATCH[2]}"
+                printf "  ${GREEN}•${NC} ${MAGENTA}@${coll}/${name}${NC}"
+                [[ -n "$desc" && "$desc" != "null" ]] && printf " - %s" "$desc"
+                printf "\n"
+            fi
+        fi
+    done
+
     echo
-    echo "For now, check GitHub directly at:"
-    echo "  ${PKGS_GITHUB_URL}/${PKGS_GITHUB_USER}?tab=repositories"
-    return 1
+    if [[ $found -eq 0 ]]; then
+        log_warn "No packages found matching '${query}'"
+    else
+        log_success "Found ${found} package(s)"
+        echo "Install with: ${CYAN}pkg-cli clone @collection/name${NC}"
+    fi
+}
+
+cmd_upgrade() {
+    log_info "Checking for package updates..."
+    echo
+
+    # Check if git is available
+    command -v git &>/dev/null || die "git is not installed"
+
+    # Find all git repos in PKGS_REMOTE_DIR
+    if [[ ! -d "${PKGS_REMOTE_DIR}" ]]; then
+        log_warn "No remote packages directory found: ${PKGS_REMOTE_DIR}"
+        return 0
+    fi
+
+    local -a packages=()
+    local -a updates=()
+
+    while IFS= read -r -d '' git_dir; do
+        local pkg_dir
+        pkg_dir="$(dirname "$git_dir")"
+        local pkg_name
+        pkg_name="$(basename "$pkg_dir")"
+
+        packages+=("$pkg_name")
+
+        log_verbose "Checking ${pkg_name}..."
+
+        # Fetch updates (don't pull yet)
+        if git -C "$pkg_dir" fetch -q 2>&1; then
+            # Check if there are updates
+            local local_hash remote_hash
+            local_hash="$(git -C "$pkg_dir" rev-parse HEAD 2>/dev/null)"
+            remote_hash="$(git -C "$pkg_dir" rev-parse @{u} 2>/dev/null || echo "$local_hash")"
+
+            if [[ "$local_hash" != "$remote_hash" ]]; then
+                updates+=("$pkg_name")
+                log_success "${pkg_name}: Update available"
+            else
+                log_verbose "${pkg_name}: Up to date"
+            fi
+        else
+            log_warn "${pkg_name}: Failed to fetch"
+        fi
+    done < <(find "${PKGS_REMOTE_DIR}" -maxdepth 2 -type d -name ".git" -print0 2>/dev/null)
+
+    echo
+
+    if [[ ${#updates[@]} -eq 0 ]]; then
+        log_success "All packages are up to date!"
+        return 0
+    fi
+
+    log_info "Updates available for ${#updates[@]} package(s):"
+    for pkg in "${updates[@]}"; do
+        echo "  • $pkg"
+    done
+    echo
+
+    read -p "Upgrade all packages? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    # Upgrade each package
+    local upgraded=0
+    local failed=0
+
+    for pkg in "${updates[@]}"; do
+        # Determine package name format
+        local pkg_ref
+        if [[ "$pkg" =~ ^pkg-([^-]+)-(.+)$ ]]; then
+            local coll="${BASH_REMATCH[1]}"
+            local name="${BASH_REMATCH[2]}"
+            pkg_ref="@${coll}/${name}"
+        else
+            pkg_ref="$pkg"
+        fi
+
+        if cmd_update "$pkg_ref"; then
+            ((upgraded++))
+        else
+            ((failed++))
+        fi
+        echo
+    done
+
+    # Summary
+    log_info "Upgrade Summary"
+    echo "─────────────────────────────────"
+    log_success "Upgraded: ${upgraded}"
+    [[ $failed -gt 0 ]] && log_error "Failed: ${failed}"
+    echo
 }
 
 # ------------------------------
@@ -1136,7 +1544,7 @@ main() {
                 cmd_help
                 exit 0
                 ;;
-            i|install|u|uninstall|r|reinstall|ls|list|info|h|help|doctor|clone|update|remote)
+            i|install|u|uninstall|r|reinstall|ls|list|info|h|help|doctor|clone|update|remote|search|upgrade)
                 command="$1"
                 shift
                 break
@@ -1159,7 +1567,7 @@ main() {
 
     # For commands that don't need to be in PKGS_SOURCE
     case "${command}" in
-        doctor|h|help|clone|update|remote)
+        doctor|h|help|clone|update|remote|search|upgrade)
             # These commands don't require being in PKGS_SOURCE
             ;;
         *)
@@ -1174,9 +1582,11 @@ main() {
         ls|list) cmd_list ;;
         info) cmd_info "${packages[@]}" ;;
         doctor) cmd_doctor ;;
+        remote) cmd_remote ;;
         clone) cmd_clone "${packages[@]}" ;;
         update) cmd_update "${packages[@]}" ;;
-        remote) cmd_remote "${packages[@]}" ;;
+        search) cmd_search "${packages[@]}" ;;
+        upgrade) cmd_upgrade ;;
         h|help) cmd_help ;;
         *) die "Unknown command: ${command}" ;;
     esac
